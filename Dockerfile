@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 安裝依賴
+# 安裝相依套件
 RUN pip install --no-cache-dir \
     influxdb-client \
     gunicorn \
@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
 # 複製應用程式
 COPY app.py .
 
-# 暴露端口
+# 公開連接埠
 EXPOSE 5354
 
 # 啟動命令

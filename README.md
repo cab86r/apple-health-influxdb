@@ -1,13 +1,13 @@
 # Apple Health to InfluxDB 2.x Ingester
 
-支援 InfluxDB 2.x Token 認證的 Apple Health 數據收集服務。
+支援 InfluxDB 2.x Token 認證的 Apple Health 資料收集服務。
 
 ## 功能
 
 - ✅ 支援 InfluxDB 2.x Token 認證
 - ✅ 接收 Health Auto Export JSON 格式
 - ✅ 處理健康指標（步數、心率、睡眠等）
-- ✅ 處理運動數據
+- ✅ 處理運動資料
 - ✅ 支援多設備（target 參數）
 
 ## 環境變數
@@ -15,7 +15,7 @@
 | 變數 | 說明 | 範例 |
 |------|------|------|
 | `INFLUX_HOST` | InfluxDB 主機 | `influxdb2.unifi-monitoring.svc.cluster.local` |
-| `INFLUX_PORT` | InfluxDB 端口 | `8086` |
+| `INFLUX_PORT` | InfluxDB 連接埠 | `8086` |
 | `INFLUX_DB` | Bucket 名稱 | `apple-health-v2` |
 | `INFLUX_ORG` | 組織名稱 | `unifi` |
 | `INFLUX_TOKEN` | API Token | `your-token-here` |
@@ -65,7 +65,7 @@ curl http://localhost:5354/health
 2. 選擇 REST API
 3. URL: `http://your-server:5354/api/healthautoexport/v1/influxdb/ingest`
 4. 格式: JSON
-5. 可選: 添加 `?target=NAME` 參數來識別數據來源
+5. 可選: 加入 `?target=NAME` 參數來識別資料來源
 
 ## 端點
 
@@ -73,7 +73,7 @@ curl http://localhost:5354/health
 |------|------|------|
 | `/` | GET | 服務資訊 |
 | `/health` | GET | 健康檢查 |
-| `/api/healthautoexport/v1/influxdb/ingest` | POST | 接收數據 |
+| `/api/healthautoexport/v1/influxdb/ingest` | POST | 接收資料 |
 
 ## 疑難排解
 
@@ -82,17 +82,17 @@ curl http://localhost:5354/health
 - 確認 `INFLUX_TOKEN` 正確
 - 確認 Token 有寫入 `apple-health-v2` bucket 的權限
 
-### 連接失敗
+### 連線失敗
 
 - 確認 InfluxDB 2.x 服務正在運行
 - 確認 K8s Service DNS 解析正確
 - 測試: `kubectl exec -n health deployment/morris-apple-health -- curl http://influxdb2.unifi-monitoring.svc.cluster.local:8086/health`
 
-### 無數據
+### 無資料
 
 - 檢查日誌中的錯誤訊息
 - 確認 Health Auto Export 設定正確
-- 確認 bucket 和 org 名稱匹配
+- 確認 bucket 和 org 名稱相符
 
 ## 版本歷史
 

@@ -10,7 +10,7 @@ from flask import Flask, request, jsonify
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-# 配置日誌
+# 設定日誌
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -19,39 +19,39 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# InfluxDB 2.x 配置
+# InfluxDB 2.x 設定
 INFLUX_URL = f"http://{os.getenv('INFLUX_HOST', 'localhost')}:{os.getenv('INFLUX_PORT', '8086')}"
 INFLUX_TOKEN = os.getenv('INFLUX_TOKEN')
 INFLUX_ORG = os.getenv('INFLUX_ORG', 'unifi')
 INFLUX_BUCKET = os.getenv('INFLUX_DB', 'apple-health-v2')
 DATAPOINTS_CHUNK = int(os.getenv('DATAPOINTS_CHUNK', '10000'))
 
-# 初始化 InfluxDB 客戶端
+# 初始化 InfluxDB 用戶端
 def get_influx_client():
-    """建立 InfluxDB 2.x 客戶端連接"""
+    """建立 InfluxDB 2.x 用戶端連線"""
     try:
         client = InfluxDBClient(
             url=INFLUX_URL,
             token=INFLUX_TOKEN,
             org=INFLUX_ORG
         )
-        # 測試連接
+        # 測試連線
         health = client.health()
         if health.status == "pass":
-            logger.info(f"✅ InfluxDB 2.x 連接成功: {INFLUX_URL}")
+            logger.info(f"✅ InfluxDB 2.x 連線成功: {INFLUX_URL}")
             return client
         else:
             logger.error(f"❌ InfluxDB 健康檢查失敗: {health}")
             return None
     except Exception as e:
-        logger.error(f"❌ InfluxDB 連接失敗: {e}")
+        logger.error(f"❌ InfluxDB 連線失敗: {e}")
         return None
 
 def write_metrics(data, target_name=None):
-    """寫入健康數據到 InfluxDB"""
+    """寫入健康資料到 InfluxDB"""
     client = get_influx_client()
     if not client:
-        return False, "無法連接 InfluxDB"
+        return False, "無法連線 InfluxDB"
     
     write_api = client.write_api(write_options=SYNCHRONOUS)
     points = []
@@ -63,7 +63,7 @@ def write_metrics(data, target_name=None):
                 metric_name = metric.get('name', 'unknown')
                 unit = metric.get('unit', '')
                 
-                # 處理每個數據點
+                # 處理每個資料點
                 for datapoint in metric.get('data', []):
                     date = datapoint.get('date')
                     qty = datapoint.get('qty')
@@ -81,7 +81,7 @@ def write_metrics(data, target_name=None):
                         
                         points.append(point)
         
-        # 處理運動數據
+        # 處理運動資料
         if 'data' in data and 'workouts' in data['data']:
             for workout in data['data']['workouts']:
                 workout_name = workout.get('name', 'unknown')
@@ -96,7 +96,7 @@ def write_metrics(data, target_name=None):
                 if target_name:
                     point = point.tag("target", target_name)
                 
-                # 添加運動統計
+                # 加入運動統計
                 for key, value in workout.items():
                     if key not in ['name', 'startDate', 'endDate'] and value is not None:
                         if isinstance(value, (int, float)):
@@ -104,7 +104,7 @@ def write_metrics(data, target_name=None):
                 
                 points.append(point)
                 
-                # 處理運動中的時間序列數據
+                # 處理運動中的時間序列資料
                 if 'heartRateData' in workout:
                     for hr_datapoint in workout['heartRateData']:
                         point = Point("heart_rate_data_bpm") \
@@ -125,29 +125,29 @@ def write_metrics(data, target_name=None):
                 org=INFLUX_ORG,
                 record=points
             )
-            logger.info(f"✅ 成功寫入 {len(points)} 個數據點到 {INFLUX_BUCKET}")
+            logger.info(f"✅ 成功寫入 {len(points)} 個資料點到 {INFLUX_BUCKET}")
         
         client.close()
-        return True, f"寫入 {len(points)} 個數據點"
+        return True, f"寫入 {len(points)} 個資料點"
         
     except Exception as e:
-        logger.error(f"❌ 寫入數據失敗: {e}")
+        logger.error(f"❌ 寫入資料失敗: {e}")
         client.close()
         return False, str(e)
 
 @app.route('/api/healthautoexport/v1/influxdb/ingest', methods=['POST'])
 def ingest():
-    """接收 Health Auto Export 數據"""
+    """接收 Health Auto Export 資料"""
     try:
         data = request.get_json()
         
         if not data:
-            return jsonify({"error": "無效的 JSON 數據"}), 400
+            return jsonify({"error": "無效的 JSON 資料"}), 400
         
-        # 獲取 target 參數（可選）
+        # 取得 target 參數（可選）
         target_name = request.args.get('target', None)
         
-        # 寫入數據
+        # 寫入資料
         success, message = write_metrics(data, target_name)
         
         if success:
