@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apple-health-builder
+  namespace: health
+spec:
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:latest
+    args:
+    - "--dockerfile=Dockerfile"
+    - "--context=git://github.com/morris9601/openclaw-workspace.git#refs/heads/main:apple-health-influxdb-v2"
+    - "--destination=morris0518/apple_health_to_influxdb:v2-influxdb2"
+    - "--destination=morris0518/apple_health_to_influxdb:latest"
+    env:
+    - name: DOCKER_CONFIG
+      value: /kaniko/.docker
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+      readOnly: true
+  volumes:
+  - name: docker-config
+    secret:
+      secretName: docker-credentials
+  restartPolicy: Never

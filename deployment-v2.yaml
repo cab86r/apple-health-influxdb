@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: morris-apple-health
+  namespace: health
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: apps.deployment-health-morris-apple-health
+  template:
+    metadata:
+      labels:
+        workload.user.cattle.io/workloadselector: apps.deployment-health-morris-apple-health
+    spec:
+      containers:
+      - name: container-0
+        image: morris0518/apple_health_to_influxdb:v2-influxdb2
+        imagePullPolicy: Always
+        env:
+        - name: INFLUX_HOST
+          value: "influxdb2.unifi-monitoring.svc.cluster.local"
+        - name: INFLUX_PORT
+          value: "8086"
+        - name: INFLUX_DB
+          value: "apple-health-v2"
+        - name: INFLUX_ORG
+          value: "unifi"
+        - name: INFLUX_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: influxdb2-credentials
+              key: token
+        - name: DATAPOINTS_CHUNK
+          value: "10000"
+        ports:
+        - containerPort: 5354
+          protocol: TCP
+        resources: {}
+        securityContext:
+          allowPrivilegeEscalation: false
+          privileged: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: false
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
