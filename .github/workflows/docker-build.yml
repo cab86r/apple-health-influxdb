@@ -26,7 +26,7 @@ jobs:
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
-          context: ./apple-health-influxdb-v2
+          context: .
           push: true
           tags: |
             morris0518/apple_health_to_influxdb:v2-influxdb2
