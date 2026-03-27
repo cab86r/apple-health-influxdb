@@ -39,7 +39,7 @@ kubectl apply -f deployment-v2.yaml
 
 # 方法 B：更新現有 deployment 的映像
 kubectl set image deployment/morris-apple-health \
-  container-0=morris0518/apple_health_to_influxdb:v2-influxdb2 \
+  container-0=morris0518/apple_health_to_influxdb:v3.1-influxdb2 \
   -n health
 ```
 
@@ -96,5 +96,7 @@ curl http://localhost:5354/health
 
 ## 版本歷史
 
+- **v3.1-influxdb2** (2026-03-28): 修復 Workout 支援 (HAE `start` 欄位、`workoutActivityType` 標籤、確保有 Field 才寫入)
+- **v3-influxdb2** (2026-03-28): 支援 Apple Shortcuts 運動紀錄、多線程非同步處理、批次寫入優化
 - **v2-influxdb2** (2026-03-27): 支援 InfluxDB 2.x Token 認證
 - **latest**: 舊版本（僅支援 InfluxDB 1.8）

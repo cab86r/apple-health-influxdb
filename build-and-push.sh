@@ -4,7 +4,7 @@
 set -e
 
 IMAGE_NAME="morris0518/apple_health_to_influxdb"
-IMAGE_TAG="v2-influxdb2"
+IMAGE_TAG="v3.1-influxdb2"
 FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "========================================="
