@@ -135,9 +135,45 @@ def write_metrics(data, target_name=None):
         client.close()
         return False, str(e)
 
+@app.route('/collect', methods=['POST'])
+def collect():
+    """接收 Health Auto Export 資料（舊版端點，相容舊設定）"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            logger.warning("⚠️ 收到空的請求")
+            return jsonify({"error": "無效的 JSON 資料"}), 400
+        
+        # 取得 target 參數（可選）
+        target_name = request.args.get('target', None)
+        
+        logger.info(f"📥 收到資料 /collect, target={target_name}")
+        
+        # 寫入資料
+        success, message = write_metrics(data, target_name)
+        
+        if success:
+            logger.info(f"✅ 資料處理成功: {message}")
+            return jsonify({
+                "status": "success",
+                "message": message,
+                "timestamp": datetime.now().isoformat()
+            }), 200
+        else:
+            logger.error(f"❌ 資料處理失敗: {message}")
+            return jsonify({
+                "status": "error",
+                "message": message
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"❌ 處理請求失敗: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/healthautoexport/v1/influxdb/ingest', methods=['POST'])
 def ingest():
-    """接收 Health Auto Export 資料"""
+    """接收 Health Auto Export 資料（新版端點）"""
     try:
         data = request.get_json()
         
@@ -181,15 +217,16 @@ def index():
     """首頁"""
     return jsonify({
         "service": "Apple Health to InfluxDB 2.x Ingester",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoints": {
+            "collect": "/collect (相容舊版)",
             "ingest": "/api/healthautoexport/v1/influxdb/ingest",
             "health": "/health"
         }
     }), 200
 
 if __name__ == '__main__':
-    logger.info(f"🚀 啟動 Apple Health Ingester v2.0")
+    logger.info(f"🚀 啟動 Apple Health Ingester v2.1")
     logger.info(f"📊 InfluxDB: {INFLUX_URL}")
     logger.info(f"📦 Bucket: {INFLUX_BUCKET}")
     logger.info(f"🏢 Org: {INFLUX_ORG}")
