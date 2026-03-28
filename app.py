@@ -1,7 +1,7 @@
 """
-Apple Health to InfluxDB 2.x Ingester v7.0
+Apple Health to InfluxDB 2.x Ingester v8.0
 Flask + Queue 背景處理架構
-逐一檢查每個值，避免 Tag/Field 同名衝突
+智慧解包巢狀 JSON，自動單位轉換
 """
 
 import os
@@ -21,7 +21,7 @@ try:
 except ImportError:
     geohash = None
 
-# --- 設定區 (完全相容 Docker/環境變數) ---
+# --- 設定區 ---
 INFLUX_HOST = os.getenv('INFLUX_HOST', 'localhost')
 INFLUX_PORT = os.getenv('INFLUX_PORT', '8086')
 INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}"
@@ -30,7 +30,7 @@ INFLUX_ORG = os.getenv('INFLUX_ORG', 'unifi')
 INFLUX_BUCKET = os.getenv('INFLUX_DB', 'apple-health-v2')
 DATAPOINTS_CHUNK = int(os.getenv('DATAPOINTS_CHUNK', '10000'))
 
-# 時區設定：預設為台北時間
+# 時區設定
 target_timezone = os.getenv('TZ', 'Asia/Taipei')
 os.environ['TZ'] = target_timezone
 try:
@@ -71,7 +71,6 @@ def process_data_worker():
     """背景處理緒：從 Queue 取出資料並寫入 InfluxDB 2.x"""
     client = get_influx_client()
     if not client:
-        logger.error("無法啟動 Worker: InfluxDB Client 初始化失敗")
         return
     
     write_api = client.write_api(write_options=SYNCHRONOUS)
@@ -92,22 +91,20 @@ def process_data_worker():
                 count = len(pts)
                 try:
                     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=pts)
-                    logger.info(f"Worker: >> 成功同步寫入批次資料 {count} 筆")
+                    logger.info(f"Worker: >> 成功同步寫入 {count} 筆")
                     return count
                 except Exception as e:
-                    logger.error(f"Worker: !! 寫入 DB 失敗: {e}")
+                    logger.error(f"Worker: !! 寫入 DB 失敗 (這批資料被丟棄): {e}")
                     return 0
 
-            # 確保資料格式是我們預期的字典
             if not isinstance(healthkit_data, dict):
-                logger.warning("收到非字典格式的數據，跳過處理。")
                 job_queue.task_done()
                 continue
 
             data_payload = healthkit_data.get("data", {})
             
             # ==========================================
-            # 1. 處理 Metrics (完美動態分類 Tags 與 Fields)
+            # 1. 處理 Metrics
             # ==========================================
             for metric in data_payload.get("metrics", []):
                 metric_name = metric.get("name", "unknown")
@@ -127,7 +124,6 @@ def process_data_worker():
                         if k == "date" or v is None:
                             continue
                         
-                        # 強制檢查每一個值，避開 Tag/Field 同名衝突
                         val_f = safe_float(v)
                         if val_f is not None:
                             p = p.field(k, val_f)
@@ -142,7 +138,7 @@ def process_data_worker():
                         points_buffer = []
 
             # ==========================================
-            # 2. 處理 Workouts (保留所有詳細資訊)
+            # 2. 處理 Workouts (智慧解包巢狀 JSON)
             # ==========================================
             for workout in data_payload.get("workouts", []):
                 workout_name = workout.get("name", "unknown")
@@ -157,16 +153,52 @@ def process_data_worker():
                 
                 field_added = False
                 exclude_keys = ['name', 'start', 'end', 'startDate', 'endDate', 'route', 'heartRateData']
+                
                 for k, v in workout.items():
                     if k in exclude_keys or v is None:
                         continue
                     
-                    val_f = safe_float(v)
-                    if val_f is not None:
-                        p = p.field(k, val_f)
+                    # 1. 如果本來就是純數字
+                    if isinstance(v, (int, float)):
+                        p = p.field(k, float(v))
                         field_added = True
+                    
+                    # 2. 如果是字典 {'qty': ..., 'units': ...}
+                    elif isinstance(v, dict):
+                        # 心率特例 (包含 avg, max, min)
+                        if k == "heartRate" and "avg" in v:
+                            for sub_k, mapped_k in [("avg", "averageHeartRate"), ("max", "maxHeartRate"), ("min", "minHeartRate")]:
+                                if sub_k in v and isinstance(v[sub_k], dict) and "qty" in v[sub_k]:
+                                    val = safe_float(v[sub_k]["qty"])
+                                    if val is not None:
+                                        p = p.field(mapped_k, val)
+                                        field_added = True
+                        
+                        # 常規的數值 + 單位字典
+                        elif "qty" in v:
+                            val = safe_float(v["qty"])
+                            unit = v.get("units", "")
+                            if val is not None:
+                                # 自動轉換單位以配合 Grafana
+                                if unit == "kJ":
+                                    val /= 4.184  # kJ 轉 kcal
+                                elif unit == "km":
+                                    val *= 1000.0  # km 轉 m
+                                p = p.field(k, val)
+                                field_added = True
+                    
+                    # 3. 如果是陣列清單，略過不存進摘要中 (以防塞爆)
+                    elif isinstance(v, list):
+                        continue
+                    
+                    # 4. 其他字串
                     else:
-                        p = p.tag(k, str(v))
+                        val_f = safe_float(v)
+                        if val_f is not None:
+                            p = p.field(k, val_f)
+                            field_added = True
+                        elif k not in ["source", "sourceName", "sourceVersion", "device"]:
+                            p = p.tag(k, str(v))
 
                 if field_added:
                     points_buffer.append(p)
@@ -179,7 +211,6 @@ def process_data_worker():
                     
                     if lat is not None and lon is not None and pt_time:
                         fixed_pt_time = pt_time.replace(" ", "T", 1) if " " in pt_time else pt_time
-                        
                         rp = Point("workout_route") \
                             .tag("source", "apple_health") \
                             .tag("workoutActivityType", workout_name) \
@@ -209,7 +240,6 @@ def process_data_worker():
                                 .field("qty", val_f)
                             points_buffer.append(hrp)
 
-                # 檢查滿載
                 if len(points_buffer) >= DATAPOINTS_CHUNK:
                     total_points_written += flush_to_db(points_buffer)
                     points_buffer = []
@@ -219,13 +249,12 @@ def process_data_worker():
                 total_points_written += flush_to_db(points_buffer)
 
             duration = time.time() - start_time
-            logger.info(f"Worker: 任務完成! 本次總共寫入 {total_points_written} 筆數據 (耗時 {duration:.2f} 秒)")
+            logger.info(f"Worker: 任務完成! 總計寫入 {total_points_written} 筆 (耗時 {duration:.2f} 秒)")
         
         except Exception as e:
             logger.exception("Worker Thread 發生未預期錯誤，正在重試...")
             time.sleep(1)
         finally:
-            # 無論成功失敗，一定要呼叫 task_done，否則佇列會卡死
             job_queue.task_done()
 
 
@@ -241,11 +270,11 @@ def collect():
     try:
         healthkit_data = request.get_json(force=True, silent=True)
         if not healthkit_data:
-            return jsonify({"status": "error", "message": "Empty or Invalid JSON"}), 400
+            return jsonify({"status": "error", "message": "Empty JSON"}), 400
 
         job_queue.put(healthkit_data)
         logger.info("HTTP: 收到請求並加入佇列")
-        return jsonify({"status": "processing", "message": "Data queued successfully"}), 202
+        return jsonify({"status": "processing", "message": "Queued"}), 202
 
     except Exception as e:
         logger.exception("Server Error")
@@ -263,23 +292,23 @@ def index():
     """首頁"""
     return jsonify({
         "service": "Apple Health to InfluxDB 2.x Ingester",
-        "version": "7.0.0 (Safe Parsing)",
+        "version": "8.0.0 (Smart Unpack)",
         "architecture": {
             "mode": "Flask + Queue Background Worker",
-            "write_mode": "SYNCHRONOUS (in worker thread)"
+            "write_mode": "SYNCHRONOUS"
         },
         "measurements": {
-            "metrics": "健康指標 (逐一檢查 Tag/Field)",
-            "workout": "運動總結",
+            "metrics": "健康指標",
+            "workout": "運動總結 (智慧解包)",
             "workout_route": "GPS 軌跡 (含 geohash)",
             "workout_heart_rate": "運動心率流"
         },
         "features": {
             "queue_processing": True,
-            "safe_parsing": True,
-            "gps_geohash": geohash is not None,
-            "instant_response": True,
-            "no_tag_field_conflict": True
+            "smart_unpack": True,
+            "unit_conversion": "kJ→kcal, km→m",
+            "heart_rate_mapping": "avg/max/min",
+            "gps_geohash": geohash is not None
         },
         "endpoints": {
             "collect": "/collect",
@@ -296,9 +325,8 @@ def index():
 if __name__ == "__main__":
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
-    logger.info(f"🚀 Apple Health Ingester v7.0 (InfluxDB 2.x Safe Parsing)")
+    logger.info(f"🚀 Apple Health Ingester v8.0 (智慧解包完美相容版)")
     logger.info(f"📊 InfluxDB: {INFLUX_URL}")
     logger.info(f"📦 Bucket: {INFLUX_BUCKET}")
-    logger.info(f"📦 Chunk Size: {DATAPOINTS_CHUNK}")
     logger.info(f"Dev Server: http://{ip_address}:5354/collect")
     app.run(host='0.0.0.0', port=5354, debug=False)
