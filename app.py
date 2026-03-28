@@ -1,7 +1,7 @@
 """
-Apple Health to InfluxDB 2.x Ingester v8.0
+Apple Health to InfluxDB 2.x Ingester v9.0
 Flask + Queue 背景處理架構
-智慧解包巢狀 JSON，自動單位轉換
+萬用陣列拆解引擎 - 自動處理 activeEnergy, distance 等每分鐘數據
 """
 
 import os
@@ -15,7 +15,6 @@ from flask import request, Flask, jsonify
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-# 容錯引入 geolib (用於計算 GPS geohash)
 try:
     from geolib import geohash
 except ImportError:
@@ -123,7 +122,6 @@ def process_data_worker():
                     for k, v in dp.items():
                         if k == "date" or v is None:
                             continue
-                        
                         val_f = safe_float(v)
                         if val_f is not None:
                             p = p.field(k, val_f)
@@ -138,7 +136,7 @@ def process_data_worker():
                         points_buffer = []
 
             # ==========================================
-            # 2. 處理 Workouts (智慧解包巢狀 JSON)
+            # 2. 處理 Workouts (完美解包)
             # ==========================================
             for workout in data_payload.get("workouts", []):
                 workout_name = workout.get("name", "unknown")
@@ -148,24 +146,21 @@ def process_data_worker():
                 
                 fixed_start = start_date.replace(" ", "T", 1) if " " in start_date else start_date
                 
-                # 2-A: 運動摘要
+                # ------------------------------------------
+                # 2-A: 運動單一摘要 (Summary)
+                # ------------------------------------------
                 p = Point("workout").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_start)
-                
                 field_added = False
-                exclude_keys = ['name', 'start', 'end', 'startDate', 'endDate', 'route', 'heartRateData']
                 
                 for k, v in workout.items():
-                    if k in exclude_keys or v is None:
+                    if v is None:
                         continue
                     
-                    # 1. 如果本來就是純數字
                     if isinstance(v, (int, float)):
                         p = p.field(k, float(v))
                         field_added = True
                     
-                    # 2. 如果是字典 {'qty': ..., 'units': ...}
                     elif isinstance(v, dict):
-                        # 心率特例 (包含 avg, max, min)
                         if k == "heartRate" and "avg" in v:
                             for sub_k, mapped_k in [("avg", "averageHeartRate"), ("max", "maxHeartRate"), ("min", "minHeartRate")]:
                                 if sub_k in v and isinstance(v[sub_k], dict) and "qty" in v[sub_k]:
@@ -173,25 +168,20 @@ def process_data_worker():
                                     if val is not None:
                                         p = p.field(mapped_k, val)
                                         field_added = True
-                        
-                        # 常規的數值 + 單位字典
                         elif "qty" in v:
                             val = safe_float(v["qty"])
                             unit = v.get("units", "")
                             if val is not None:
-                                # 自動轉換單位以配合 Grafana
                                 if unit == "kJ":
-                                    val /= 4.184  # kJ 轉 kcal
+                                    val /= 4.184
                                 elif unit == "km":
-                                    val *= 1000.0  # km 轉 m
+                                    val *= 1000.0
                                 p = p.field(k, val)
                                 field_added = True
                     
-                    # 3. 如果是陣列清單，略過不存進摘要中 (以防塞爆)
                     elif isinstance(v, list):
-                        continue
+                        continue  # 陣列跳過，交給後面的 2-B, 2-C, 2-D 去拆解
                     
-                    # 4. 其他字串
                     else:
                         val_f = safe_float(v)
                         if val_f is not None:
@@ -203,29 +193,25 @@ def process_data_worker():
                 if field_added:
                     points_buffer.append(p)
 
-                # 2-B: GPS 軌跡
+                # ------------------------------------------
+                # 2-B: GPS 軌跡 (特規陣列拆解)
+                # ------------------------------------------
                 for gps_point in workout.get("route", []):
                     lat = gps_point.get("lat")
                     lon = gps_point.get("lon")
                     pt_time = gps_point.get("timestamp")
-                    
                     if lat is not None and lon is not None and pt_time:
                         fixed_pt_time = pt_time.replace(" ", "T", 1) if " " in pt_time else pt_time
-                        rp = Point("workout_route") \
-                            .tag("source", "apple_health") \
-                            .tag("workoutActivityType", workout_name) \
-                            .time(fixed_pt_time) \
-                            .field("lat", float(lat)) \
-                            .field("lon", float(lon))
-                        
+                        rp = Point("workout_route").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_pt_time).field("lat", float(lat)).field("lon", float(lon))
                         if gps_point.get("altitude") is not None:
                             rp = rp.field("altitude", float(gps_point["altitude"]))
                         if geohash:
                             rp = rp.field("geohash", geohash.encode(float(lat), float(lon), 7))
-                        
                         points_buffer.append(rp)
 
-                # 2-C: 高頻心率流
+                # ------------------------------------------
+                # 2-C: 高頻心率流 (特規陣列拆解)
+                # ------------------------------------------
                 for hr in workout.get('heartRateData', []):
                     qty = hr.get('qty')
                     hr_time = hr.get('date', hr.get('timestamp'))
@@ -233,12 +219,36 @@ def process_data_worker():
                         fixed_hr_time = hr_time.replace(" ", "T", 1) if " " in hr_time else hr_time
                         val_f = safe_float(qty)
                         if val_f is not None:
-                            hrp = Point("workout_heart_rate") \
-                                .tag("source", "apple_health") \
-                                .tag("workoutActivityType", workout_name) \
-                                .time(fixed_hr_time) \
-                                .field("qty", val_f)
+                            hrp = Point("workout_heart_rate").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_hr_time).field("qty", val_f)
                             points_buffer.append(hrp)
+
+                # ------------------------------------------
+                # 🌟 2-D: 萬用陣列拆解引擎 (處理 activeEnergy, distance 等每分鐘數據)
+                # ------------------------------------------
+                for k, v in workout.items():
+                    if isinstance(v, list) and k not in ['route', 'heartRateData']:
+                        for item in v:
+                            if isinstance(item, dict):
+                                qty = item.get('qty')
+                                pt_time = item.get('date', item.get('timestamp'))
+                                if qty is not None and pt_time:
+                                    fixed_pt_time = pt_time.replace(" ", "T", 1) if " " in pt_time else pt_time
+                                    val_f = safe_float(qty)
+                                    unit = item.get('units', '')
+                                    
+                                    # 單位轉換
+                                    if val_f is not None:
+                                        if unit == "kJ":
+                                            val_f /= 4.184
+                                        elif unit == "km":
+                                            val_f *= 1000.0
+                                        
+                                        dp = Point(f"workout_{k}") \
+                                            .tag("source", "apple_health") \
+                                            .tag("workoutActivityType", workout_name) \
+                                            .time(fixed_pt_time) \
+                                            .field("qty", val_f)
+                                        points_buffer.append(dp)
 
                 if len(points_buffer) >= DATAPOINTS_CHUNK:
                     total_points_written += flush_to_db(points_buffer)
@@ -271,11 +281,9 @@ def collect():
         healthkit_data = request.get_json(force=True, silent=True)
         if not healthkit_data:
             return jsonify({"status": "error", "message": "Empty JSON"}), 400
-
         job_queue.put(healthkit_data)
         logger.info("HTTP: 收到請求並加入佇列")
         return jsonify({"status": "processing", "message": "Queued"}), 202
-
     except Exception as e:
         logger.exception("Server Error")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -292,22 +300,23 @@ def index():
     """首頁"""
     return jsonify({
         "service": "Apple Health to InfluxDB 2.x Ingester",
-        "version": "8.0.0 (Smart Unpack)",
+        "version": "9.0.0 (Universal Array Parser)",
         "architecture": {
             "mode": "Flask + Queue Background Worker",
             "write_mode": "SYNCHRONOUS"
         },
         "measurements": {
             "metrics": "健康指標",
-            "workout": "運動總結 (智慧解包)",
-            "workout_route": "GPS 軌跡 (含 geohash)",
-            "workout_heart_rate": "運動心率流"
+            "workout": "運動總結",
+            "workout_route": "GPS 軌跡",
+            "workout_heart_rate": "運動心率流",
+            "workout_*": "萬用陣列 (activeEnergy, distance 等)"
         },
         "features": {
             "queue_processing": True,
             "smart_unpack": True,
+            "universal_array_parser": True,
             "unit_conversion": "kJ→kcal, km→m",
-            "heart_rate_mapping": "avg/max/min",
             "gps_geohash": geohash is not None
         },
         "endpoints": {
@@ -325,7 +334,7 @@ def index():
 if __name__ == "__main__":
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
-    logger.info(f"🚀 Apple Health Ingester v8.0 (智慧解包完美相容版)")
+    logger.info(f"🚀 Apple Health Ingester v9.0 (萬用解包全收錄版)")
     logger.info(f"📊 InfluxDB: {INFLUX_URL}")
     logger.info(f"📦 Bucket: {INFLUX_BUCKET}")
     logger.info(f"Dev Server: http://{ip_address}:5354/collect")
