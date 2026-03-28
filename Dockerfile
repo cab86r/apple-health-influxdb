@@ -6,7 +6,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     influxdb-client \
     gunicorn \
-    flask
+    flask \
+    geolib
 
 # 複製應用程式
 COPY app.py .
