@@ -32,7 +32,9 @@ spec:
               name: influxdb2-credentials
               key: token
         - name: DATAPOINTS_CHUNK
-          value: "10000"
+          value: "2000"
+        - name: MAX_WORKERS
+          value: "4"
         ports:
         - containerPort: 5354
           protocol: TCP
