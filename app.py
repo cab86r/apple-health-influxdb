@@ -1,7 +1,7 @@
 """
-Apple Health to InfluxDB 2.x Ingester v6.0
+Apple Health to InfluxDB 2.x Ingester v7.0
 Flask + Queue 背景處理架構
-動態 Tags/Fields 解析，完整資料收集
+逐一檢查每個值，避免 Tag/Field 同名衝突
 """
 
 import os
@@ -21,12 +21,14 @@ try:
 except ImportError:
     geohash = None
 
-# --- 設定區 (從環境變數讀取) ---
-INFLUX_URL = f"http://{os.getenv('INFLUX_HOST', 'localhost')}:{os.getenv('INFLUX_PORT', '8086')}"
-INFLUX_TOKEN = os.getenv('INFLUX_TOKEN')
+# --- 設定區 (完全相容 Docker/環境變數) ---
+INFLUX_HOST = os.getenv('INFLUX_HOST', 'localhost')
+INFLUX_PORT = os.getenv('INFLUX_PORT', '8086')
+INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}"
+INFLUX_TOKEN = os.getenv('INFLUX_TOKEN', 'your-token-here')
 INFLUX_ORG = os.getenv('INFLUX_ORG', 'unifi')
 INFLUX_BUCKET = os.getenv('INFLUX_DB', 'apple-health-v2')
-DATAPOINTS_CHUNK = int(os.getenv('DATAPOINTS_CHUNK', '5000'))
+DATAPOINTS_CHUNK = int(os.getenv('DATAPOINTS_CHUNK', '10000'))
 
 # 時區設定：預設為台北時間
 target_timezone = os.getenv('TZ', 'Asia/Taipei')
@@ -66,17 +68,13 @@ def safe_float(val):
 
 
 def process_data_worker():
-    """
-    背景處理緒：從 Queue 取出資料並寫入 InfluxDB 2.x
-    """
+    """背景處理緒：從 Queue 取出資料並寫入 InfluxDB 2.x"""
     client = get_influx_client()
     if not client:
         logger.error("無法啟動 Worker: InfluxDB Client 初始化失敗")
         return
     
-    # 在背景線程中使用同步寫入，確保穩定性與即時報錯
     write_api = client.write_api(write_options=SYNCHRONOUS)
-
     logger.info(f"Worker Thread Started. Target DB: {INFLUX_URL} bucket: {INFLUX_BUCKET}")
     
     while True:
@@ -94,55 +92,48 @@ def process_data_worker():
                 count = len(pts)
                 try:
                     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=pts)
-                    logger.info(f"Worker: >> 成功寫入批次資料 {count} 筆")
+                    logger.info(f"Worker: >> 成功同步寫入批次資料 {count} 筆")
                     return count
                 except Exception as e:
                     logger.error(f"Worker: !! 寫入 DB 失敗: {e}")
                     return 0
 
+            # 確保資料格式是我們預期的字典
+            if not isinstance(healthkit_data, dict):
+                logger.warning("收到非字典格式的數據，跳過處理。")
+                job_queue.task_done()
+                continue
+
             data_payload = healthkit_data.get("data", {})
             
             # ==========================================
-            # 1. 處理 Metrics (動態分類 Tags 與 Fields)
+            # 1. 處理 Metrics (完美動態分類 Tags 與 Fields)
             # ==========================================
             for metric in data_payload.get("metrics", []):
                 metric_name = metric.get("name", "unknown")
-                data_points = metric.get("data", [])
-                if not data_points:
-                    continue
+                unit = metric.get("unit", "")
+                measurement = f"{metric_name}_{unit}" if unit else metric_name
                 
-                # 自動判斷這批資料哪些是數字(Fields)，哪些是字串(Tags)
-                first_point = data_points[0]
-                keys = set(first_point.keys()) - {"date"}
-                number_keys = [k for k in keys if isinstance(first_point[k], (int, float))]
-                string_keys = [k for k in keys if k not in number_keys]
-
-                for dp in data_points:
+                for dp in metric.get("data", []):
                     date_str = dp.get("date")
                     if not date_str:
                         continue
+                    
                     fixed_date = date_str.replace(" ", "T", 1) if " " in date_str else date_str
+                    p = Point(measurement).tag("source", "apple_health").time(fixed_date)
                     
-                    p = Point(metric_name).tag("source", "apple_health").time(fixed_date)
-                    
-                    # 寫入 Tags
-                    for k in string_keys:
-                        if dp.get(k) is not None:
-                            p = p.tag(k, str(dp[k]))
-                    
-                    # 寫入 Fields
                     field_added = False
-                    for k in number_keys:
-                        if dp.get(k) is not None:
-                            p = p.field(k, float(dp[k]))
+                    for k, v in dp.items():
+                        if k == "date" or v is None:
+                            continue
+                        
+                        # 強制檢查每一個值，避開 Tag/Field 同名衝突
+                        val_f = safe_float(v)
+                        if val_f is not None:
+                            p = p.field(k, val_f)
                             field_added = True
-                    
-                    # 容錯：如果原本判斷為字串，但其實有 qty 數值，救回來
-                    if not field_added and "qty" in dp:
-                        val = safe_float(dp["qty"])
-                        if val is not None:
-                            p = p.field("qty", val)
-                            field_added = True
+                        else:
+                            p = p.tag(k, str(v))
 
                     if field_added:
                         points_buffer.append(p)
@@ -169,16 +160,13 @@ def process_data_worker():
                 for k, v in workout.items():
                     if k in exclude_keys or v is None:
                         continue
-                    if isinstance(v, (int, float)):
-                        p = p.field(k, float(v))
+                    
+                    val_f = safe_float(v)
+                    if val_f is not None:
+                        p = p.field(k, val_f)
                         field_added = True
                     else:
-                        val_f = safe_float(v)
-                        if val_f is not None:
-                            p = p.field(k, val_f)
-                            field_added = True
-                        else:
-                            p = p.tag(k, str(v))  # 純文字寫為 Tag
+                        p = p.tag(k, str(v))
 
                 if field_added:
                     points_buffer.append(p)
@@ -212,14 +200,16 @@ def process_data_worker():
                     hr_time = hr.get('date', hr.get('timestamp'))
                     if qty is not None and hr_time:
                         fixed_hr_time = hr_time.replace(" ", "T", 1) if " " in hr_time else hr_time
-                        hrp = Point("workout_heart_rate") \
-                            .tag("source", "apple_health") \
-                            .tag("workoutActivityType", workout_name) \
-                            .time(fixed_hr_time) \
-                            .field("qty", float(qty))
-                        points_buffer.append(hrp)
+                        val_f = safe_float(qty)
+                        if val_f is not None:
+                            hrp = Point("workout_heart_rate") \
+                                .tag("source", "apple_health") \
+                                .tag("workoutActivityType", workout_name) \
+                                .time(fixed_hr_time) \
+                                .field("qty", val_f)
+                            points_buffer.append(hrp)
 
-                # 在 Workout 迴圈內檢查滿載 (因為 GPS/心率陣列非常大)
+                # 檢查滿載
                 if len(points_buffer) >= DATAPOINTS_CHUNK:
                     total_points_written += flush_to_db(points_buffer)
                     points_buffer = []
@@ -229,12 +219,14 @@ def process_data_worker():
                 total_points_written += flush_to_db(points_buffer)
 
             duration = time.time() - start_time
-            logger.info(f"Worker: 任務完成! 本次總共寫入 {total_points_written} 筆 InfluxDB 2.x 數據 (耗時 {duration:.2f} 秒)")
-            job_queue.task_done()
-
-        except Exception:
+            logger.info(f"Worker: 任務完成! 本次總共寫入 {total_points_written} 筆數據 (耗時 {duration:.2f} 秒)")
+        
+        except Exception as e:
             logger.exception("Worker Thread 發生未預期錯誤，正在重試...")
             time.sleep(1)
+        finally:
+            # 無論成功失敗，一定要呼叫 task_done，否則佇列會卡死
+            job_queue.task_done()
 
 
 # 啟動背景 Worker
@@ -251,10 +243,8 @@ def collect():
         if not healthkit_data:
             return jsonify({"status": "error", "message": "Empty or Invalid JSON"}), 400
 
-        # 將資料塞入佇列，交給背景 Worker 處理
         job_queue.put(healthkit_data)
-        
-        logger.info("HTTP: Request received and queued.")
+        logger.info("HTTP: 收到請求並加入佇列")
         return jsonify({"status": "processing", "message": "Data queued successfully"}), 202
 
     except Exception as e:
@@ -273,22 +263,23 @@ def index():
     """首頁"""
     return jsonify({
         "service": "Apple Health to InfluxDB 2.x Ingester",
-        "version": "6.0.0 (Queue Architecture)",
+        "version": "7.0.0 (Safe Parsing)",
         "architecture": {
             "mode": "Flask + Queue Background Worker",
             "write_mode": "SYNCHRONOUS (in worker thread)"
         },
         "measurements": {
-            "metrics": "健康指標 (動態 Tags/Fields)",
+            "metrics": "健康指標 (逐一檢查 Tag/Field)",
             "workout": "運動總結",
             "workout_route": "GPS 軌跡 (含 geohash)",
             "workout_heart_rate": "運動心率流"
         },
         "features": {
             "queue_processing": True,
-            "dynamic_parsing": True,
+            "safe_parsing": True,
             "gps_geohash": geohash is not None,
-            "instant_response": True
+            "instant_response": True,
+            "no_tag_field_conflict": True
         },
         "endpoints": {
             "collect": "/collect",
@@ -305,8 +296,9 @@ def index():
 if __name__ == "__main__":
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
-    logger.info(f"🚀 Apple Health Ingester v6.0 (InfluxDB 2.x Queue Architecture)")
+    logger.info(f"🚀 Apple Health Ingester v7.0 (InfluxDB 2.x Safe Parsing)")
     logger.info(f"📊 InfluxDB: {INFLUX_URL}")
     logger.info(f"📦 Bucket: {INFLUX_BUCKET}")
+    logger.info(f"📦 Chunk Size: {DATAPOINTS_CHUNK}")
     logger.info(f"Dev Server: http://{ip_address}:5354/collect")
     app.run(host='0.0.0.0', port=5354, debug=False)
