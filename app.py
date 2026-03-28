@@ -147,8 +147,12 @@ def process_data_worker(worker_id):
                 exclude_keys = ['name', 'start', 'end', 'startDate', 'endDate', 'route', 'heartRateData']
                 
                 for k, v in workout.items():
-                    if v is None: continue
-                    if isinstance(v, (int, float)):
+                    if v is None or k in exclude_keys: continue
+                    
+                    if isinstance(v, bool):
+                        p = p.field(k, v) # 保留布林值
+                        field_added = True
+                    elif isinstance(v, (int, float)):
                         p = p.field(k, float(v))
                         field_added = True
                     elif isinstance(v, dict):
