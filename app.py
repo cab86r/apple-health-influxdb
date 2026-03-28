@@ -20,10 +20,8 @@ INFLUX_PORT = os.getenv('INFLUX_PORT', '8086')
 INFLUX_URL = f"http://{INFLUX_HOST}:{INFLUX_PORT}"
 INFLUX_TOKEN = os.getenv('INFLUX_TOKEN', 'your-token-here')
 INFLUX_ORG = os.getenv('INFLUX_ORG', 'unifi')
-INFLUX_BUCKET = os.getenv('INFLUX_DB', 'apple-health-v2') 
-# 🌟 強制設定為 2000，確保每批資料量輕盈
+INFLUX_BUCKET = os.getenv('INFLUX_DB', 'apple-health-v2')
 DATAPOINTS_CHUNK = 2000
-# 🌟 建議設為 4 或 8，避免 16 個工人讓資料庫 IO 塞車
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 4))
 
 target_timezone = os.getenv('TZ', 'Asia/Taipei')
@@ -93,7 +91,7 @@ def process_data_worker(worker_id):
                     except Exception as dump_err:
                         pass
                 finally:
-                    points_buffer.clear() # 無論成功失敗，一定要清空雙手
+                    points_buffer.clear()
 
             def add_point(p):
                 """將資料加入緩衝區，一旦滿載立刻發車"""
@@ -132,7 +130,7 @@ def process_data_worker(worker_id):
                             p = p.tag(k, str(v))
 
                     if field_added:
-                        add_point(p) # 統一透過管制器加入
+                        add_point(p)
 
             # --- 解析 Workouts ---
             for workout in data_payload.get("workouts", []):
@@ -150,7 +148,7 @@ def process_data_worker(worker_id):
                     if v is None or k in exclude_keys: continue
                     
                     if isinstance(v, bool):
-                        p = p.field(k, v) # 保留布林值
+                        p = p.field(k, v)
                         field_added = True
                     elif isinstance(v, (int, float)):
                         p = p.field(k, float(v))
@@ -182,30 +180,50 @@ def process_data_worker(worker_id):
                             p = p.tag(k, str(v))
 
                 if field_added:
-                    add_point(p) # 統一透過管制器加入
+                    add_point(p)
 
                 # 2-B: GPS 軌跡
                 for gps_point in workout.get("route", []):
-                    lat = gps_point.get("lat")
-                    lon = gps_point.get("lon")
-                    pt_time = gps_point.get("timestamp")
+                    lat = gps_point.get("lat", gps_point.get("latitude"))
+                    lon = gps_point.get("lon", gps_point.get("longitude"))
+                    pt_time = gps_point.get("timestamp", gps_point.get("date"))
+                    
                     if lat is not None and lon is not None and pt_time:
                         fixed_pt_time = pt_time.replace(" ", "T", 1) if " " in pt_time else pt_time
                         rp = Point("workout_route").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_pt_time).field("lat", float(lat)).field("lon", float(lon))
-                        if gps_point.get("altitude") is not None: rp = rp.field("altitude", float(gps_point["altitude"]))
-                        if geohash: rp = rp.field("geohash", geohash.encode(float(lat), float(lon), 7))
-                        add_point(rp) # 統一透過管制器加入
+                        
+                        for extra_k in ["altitude", "speed", "course", "horizontalAccuracy", "verticalAccuracy"]:
+                            if gps_point.get(extra_k) is not None:
+                                rp = rp.field(extra_k, float(gps_point[extra_k]))
 
-                # 2-C: 心率流
+                        if geohash:
+                            rp = rp.field("geohash", geohash.encode(float(lat), float(lon), 7))
+                        add_point(rp)
+
+                # 2-C: 心率流 (修復 Avg/Max/Min 格式)
                 for hr in workout.get('heartRateData', []):
-                    qty = hr.get('qty')
                     hr_time = hr.get('date', hr.get('timestamp'))
-                    if qty is not None and hr_time:
-                        fixed_hr_time = hr_time.replace(" ", "T", 1) if " " in hr_time else hr_time
-                        val_f = safe_float(qty)
+                    if not hr_time: continue
+                    fixed_hr_time = hr_time.replace(" ", "T", 1) if " " in hr_time else hr_time
+                    
+                    hrp = Point("workout_heart_rate").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_hr_time)
+                    hr_field_added = False
+                    
+                    if 'qty' in hr:
+                        val_f = safe_float(hr['qty'])
                         if val_f is not None:
-                            hrp = Point("workout_heart_rate").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_hr_time).field("qty", val_f)
-                            add_point(hrp) # 統一透過管制器加入
+                            hrp = hrp.field("qty", val_f)
+                            hr_field_added = True
+                    else:
+                        for k in ['Avg', 'Max', 'Min']:
+                            if k in hr:
+                                val_f = safe_float(hr[k])
+                                if val_f is not None:
+                                    hrp = hrp.field(k.lower(), val_f)
+                                    hr_field_added = True
+
+                    if hr_field_added:
+                        add_point(hrp)
 
                 # 2-D: 萬用陣列拆解
                 for k, v in workout.items():
@@ -222,10 +240,9 @@ def process_data_worker(worker_id):
                                         if unit == "kJ": val_f /= 4.184
                                         elif unit == "km": val_f *= 1000.0
                                         dp = Point(f"workout_{k}").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_pt_time).field("qty", val_f)
-                                        add_point(dp) # 統一透過管制器加入
+                                        add_point(dp)
 
-            # --- 收尾寫入 ---
-            flush_to_db() # 迴圈結束後，把剩下的零頭送出去
+            flush_to_db()
 
             duration = time.time() - start_time
             logger.info(f"任務完成! 總計寫入 {total_points_written} 筆 (耗時 {duration:.2f} 秒)")
@@ -255,10 +272,11 @@ def collect():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
-def health(): return "OK", 200
+def health():
+    return "OK", 200
 
 if __name__ == "__main__":
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
-    logger.info(f"🚀 Apple Health Ingester v10.1 (嚴格緩衝區管制版)")
+    logger.info(f"🚀 Apple Health Ingester v10.2 (已修復 Route 與 HeartRate 屬性綁定)")
     app.run(host='0.0.0.0', port=5354, debug=False)
