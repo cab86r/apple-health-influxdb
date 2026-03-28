@@ -1,7 +1,7 @@
 """
-Apple Health to InfluxDB 2.x Ingester v3.2.0
+Apple Health to InfluxDB 2.x Ingester v5.0
 支援 Health Auto Export JSON 格式 + Apple Shortcuts 格式
-非同步寫入錯誤監聽器，批次寫入優化
+完整資料收集：一般指標、運動總結、GPS 軌跡、高解析度心率
 """
 
 import os
@@ -37,24 +37,20 @@ def get_influx_client():
     try:
         return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=30000)
     except Exception as e:
-        logger.error(f"❌ InfluxDB 用戶端建立失敗: {e}")
+        logger.error(f"❌ InfluxDB 建立失敗: {e}")
         return None
 
 
-# ==========================================
-# 監聽器：專門捕捉非同步寫入的「無聲錯誤」
-# ==========================================
 def on_success(conf, data: str):
-    pass  # 成功批次寫入時不特別刷 Log
+    pass
 
 
 def on_error(conf, data: str, exception: Exception):
-    logger.error(f"🚨 InfluxDB 拒絕了這批資料! 原因: {exception}")
-    logger.debug(f"被拒絕的資料內容前 200 字元: {data[:200]}")
+    logger.error(f"🚨 InfluxDB 拒絕資料! 原因: {exception}")
 
 
 def on_retry(conf, data: str, exception: Exception):
-    logger.warning(f"⚠️ InfluxDB 寫入重試中... 原因: {exception}")
+    logger.warning(f"⚠️ 寫入重試中... 原因: {exception}")
 
 
 def process_data_background(data, target_name):
@@ -63,7 +59,6 @@ def process_data_background(data, target_name):
     if not client:
         return
     
-    # 恢復「非同步批次處理」以確保效能，並掛上錯誤監聽器
     write_api = client.write_api(
         write_options=WriteOptions(
             batch_size=DATAPOINTS_CHUNK,
@@ -81,10 +76,11 @@ def process_data_background(data, target_name):
     
     try:
         # ==========================================
-        # 格式 1: Health Auto Export 格式
+        # 格式 1: Health Auto Export JSON 格式
         # ==========================================
         if isinstance(data, dict) and 'data' in data:
-            # 處理一般 metrics
+            
+            # --- 1. 處理一般連續性數據 (Metrics) ---
             for metric in data['data'].get('metrics', []):
                 metric_name = metric.get('name', 'unknown')
                 unit = metric.get('unit', '')
@@ -93,19 +89,14 @@ def process_data_background(data, target_name):
                     date_str = datapoint.get('date')
                     qty = datapoint.get('qty')
                     if date_str and qty is not None:
-                        # 修復時間格式 (如果有空白，替換為 T 以符合 ISO8601)
                         fixed_date = date_str.replace(" ", "T", 1) if " " in date_str else date_str
-                        
                         measurement = f"{metric_name}_{unit}" if unit else metric_name
-                        p = Point(measurement) \
-                            .tag("source", "apple_health") \
-                            .field("qty", float(qty)) \
-                            .time(fixed_date)
+                        p = Point(measurement).tag("source", "apple_health").field("qty", float(qty)).time(fixed_date)
                         if target_name:
                             p = p.tag("target", target_name)
                         points.append(p)
             
-            # 處理 workouts
+            # --- 2. 處理運動紀錄 (Workouts) ---
             for workout in data['data'].get('workouts', []):
                 workout_name = workout.get('name', 'unknown')
                 start_date = workout.get('start', workout.get('startDate'))
@@ -113,11 +104,8 @@ def process_data_background(data, target_name):
                 if start_date:
                     fixed_start = start_date.replace(" ", "T", 1) if " " in start_date else start_date
                     
-                    p = Point("workout") \
-                        .tag("source", "apple_health") \
-                        .tag("workoutActivityType", workout_name) \
-                        .time(fixed_start)
-                    
+                    # 2-A: 寫入運動總結資料 (Duration, Calories, etc.)
+                    p = Point("workout").tag("source", "apple_health").tag("workoutActivityType", workout_name).time(fixed_start)
                     if target_name:
                         p = p.tag("target", target_name)
                     
@@ -128,13 +116,50 @@ def process_data_background(data, target_name):
                             if isinstance(value, (int, float)):
                                 p = p.field(key, float(value))
                                 field_added = True
-                    
-                    # 確保至少有一個數值才寫入
                     if field_added:
                         points.append(p)
-        
+
+                    # 2-B: 寫入 GPS 軌跡 (Route)
+                    route_data = workout.get('route', [])
+                    if isinstance(route_data, list) and len(route_data) > 0:
+                        for pt in route_data:
+                            lat = pt.get('lat')
+                            lon = pt.get('lon')
+                            alt = pt.get('altitude')
+                            pt_time = pt.get('timestamp')
+                            if lat is not None and lon is not None and pt_time:
+                                fixed_pt_time = pt_time.replace(" ", "T", 1) if " " in pt_time else pt_time
+                                rp = Point("workout_route") \
+                                    .tag("source", "apple_health") \
+                                    .tag("workoutActivityType", workout_name) \
+                                    .time(fixed_pt_time) \
+                                    .field("lat", float(lat)) \
+                                    .field("lon", float(lon))
+                                if alt is not None:
+                                    rp = rp.field("altitude", float(alt))
+                                if target_name:
+                                    rp = rp.tag("target", target_name)
+                                points.append(rp)
+
+                    # 2-C: 寫入高解析度連續心率 (Heart Rate Data)
+                    hr_data = workout.get('heartRateData', [])
+                    if isinstance(hr_data, list) and len(hr_data) > 0:
+                        for hr in hr_data:
+                            qty = hr.get('qty')
+                            hr_time = hr.get('date', hr.get('timestamp'))
+                            if qty is not None and hr_time:
+                                fixed_hr_time = hr_time.replace(" ", "T", 1) if " " in hr_time else hr_time
+                                hrp = Point("workout_heart_rate") \
+                                    .tag("source", "apple_health") \
+                                    .tag("workoutActivityType", workout_name) \
+                                    .time(fixed_hr_time) \
+                                    .field("qty", float(qty))
+                                if target_name:
+                                    hrp = hrp.tag("target", target_name)
+                                points.append(hrp)
+
         # ==========================================
-        # 格式 2: Apple 捷徑 (Shortcuts)
+        # 格式 2: Apple Shortcuts 捷徑格式 (完整加回)
         # ==========================================
         elif isinstance(data, list):
             for item in data:
@@ -158,15 +183,14 @@ def process_data_background(data, target_name):
             logger.warning("⚠️ 收到未知格式的 JSON，放棄處理。")
             return
         
-        # 丟進排程隊列
+        # 執行批次寫入
         if points:
             write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
-            logger.info(f"✅ 成功將 {len(points)} 個資料點交給非同步引擎處理 (含 Workout)。")
+            logger.info(f"✅ 成功排程寫入 {len(points)} 個資料點 (包含 GPS 軌跡與心率流)。")
     
     except Exception as e:
-        logger.error(f"❌ 解析資料發生錯誤: {e}", exc_info=True)
+        logger.error(f"❌ 解析錯誤: {e}", exc_info=True)
     finally:
-        # 強制將緩衝區內還沒送出的資料沖刷 (Flush) 到資料庫，然後關閉
         write_api.flush()
         write_api.close()
         client.close()
@@ -176,20 +200,11 @@ def process_data_background(data, target_name):
 @app.route('/collect', methods=['POST'])
 def ingest():
     """統一入口：接收資料並交給背景線程處理"""
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"status": "error", "message": "無效的 JSON"}), 400
-        
-        target_name = request.args.get('target', None)
-        executor.submit(process_data_background, data, target_name)
-        
-        # 手機端直接收到 202 Accepted，完全不用等
-        return jsonify({"status": "processing"}), 202
-    
-    except Exception as e:
-        logger.error(f"❌ 接收請求失敗: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error", "message": "無效的 JSON"}), 400
+    executor.submit(process_data_background, data, request.args.get('target', None))
+    return jsonify({"status": "processing"}), 202
 
 
 @app.route('/health', methods=['GET'])
@@ -209,12 +224,21 @@ def index():
     """首頁"""
     return jsonify({
         "service": "Apple Health to InfluxDB 2.x Ingester",
-        "version": "3.2.0 (Async Safe)",
+        "version": "5.0.0 (Full Data Collection)",
+        "measurements": {
+            "metrics": "健康指標 (步數、心率、睡眠等)",
+            "workout": "運動總結 (距離、卡路里、時長)",
+            "workout_route": "GPS 軌跡 (經緯度、海拔)",
+            "workout_heart_rate": "運動心率流 (每秒心率)"
+        },
         "features": {
             "multi_threaded": True,
             "async_write": True,
             "batch_write": True,
             "workout_support": True,
+            "gps_route_support": True,
+            "heart_rate_stream": True,
+            "shortcuts_support": True,
             "error_callbacks": True
         },
         "endpoints": {
@@ -231,7 +255,7 @@ def index():
 
 
 if __name__ == '__main__':
-    logger.info(f"🚀 啟動 Apple Health Ingester v3.2 (非同步攔截版)")
+    logger.info(f"🚀 Apple Health Ingester v5.0 (資料不遺漏全解析版)")
     logger.info(f"📊 InfluxDB: {INFLUX_URL}")
     logger.info(f"📦 Bucket: {INFLUX_BUCKET}")
     logger.info(f"⚙️ Worker 數量: {MAX_WORKERS}")
