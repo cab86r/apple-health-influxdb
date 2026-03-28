@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apple-health-debug
+  namespace: health
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apple-health-debug
+  template:
+    metadata:
+      labels:
+        app: apple-health-debug
+    spec:
+      containers:
+      - name: debug-receiver
+        image: morris0518/apple_health_debug:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5355
+          protocol: TCP
+        volumeMounts:
+        - name: raw-data
+          mountPath: /app/raw_data
+      volumes:
+      - name: raw-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apple-health-debug
+  namespace: health
+spec:
+  selector:
+    app: apple-health-debug
+  ports:
+  - port: 5355
+    targetPort: 5355
+    protocol: TCP
+  type: ClusterIP

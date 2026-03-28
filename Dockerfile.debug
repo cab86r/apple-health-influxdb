@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安裝相依套件
+RUN pip install --no-cache-dir flask
+
+# 複製除錯接收器
+COPY debug_receiver.py .
+
+# 建立資料儲存目錄
+RUN mkdir -p /app/raw_data
+
+# 公開連接埠
+EXPOSE 5355
+
+# 啟動命令
+CMD ["python", "debug_receiver.py"]
